@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local system/editor files
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets and local environment
+.env
+.env.*
+*.key
+*service-account*.json
+
+# Generated run state and outputs
+data/*.xlsx
+data/*coverage_state*.json
+output/*.json
+output/*.png
+output/*.jpg
+reports/
+
+# Temporary rollout/debug artifacts
+output/rollout_*.json
+data/rollout_*.json

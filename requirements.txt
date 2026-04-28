@@ -1,0 +1,7 @@
+google-genai
+matplotlib
+openai
+openpyxl
+pandas
+pyyaml
+seaborn

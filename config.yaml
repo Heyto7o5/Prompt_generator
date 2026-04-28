@@ -1,0 +1,176 @@
+# Prompt自动生成框架 V2 配置文件
+
+# 概念类目树路径
+concept_tree:
+  path: "data/类目树-for生产数据.xlsx"
+
+# 维度定义（可扩展，新增大类只需加一条）
+dimensions:
+  - key: subject
+    sheet: 主体
+    core_priority: 1
+    companion: true
+  - key: motion
+    sheet: 运动
+    core_priority: 2
+    companion: true
+  - key: scene
+    sheet: 场景
+    core_priority: 3
+    companion: true
+  - key: audio
+    sheet: 音频类型
+    core_priority: 4
+    companion: true
+
+# 生成配置
+generation:
+  active_llms:
+    - dpsk
+  max_prompts: 0
+
+# 核心概念驱动采样配置
+core_sampling:
+  sampling_mode: "core_concept"
+  batch_size: 10
+  coverage_state_path: "data/dpsk_coverage_state.json"
+  selection_llm_provider: "dpsk"  # 阶段一二级类目选择也使用 dpsk-v3
+  max_retries: 2
+  level3_mode: "traverse"         # "traverse" | "llm_select"
+  num_dimensions_per_combo: 4     # 阶段一每个组合选几个维度
+
+# 难度配置
+difficulty:
+  # 阶段一覆盖优先：只用中高难度推进多维覆盖，低难度在阶段二按 3:5:2 补齐
+  phase1_distribution:
+    medium: 70
+    high: 30
+
+  distribution:
+    low: 30
+    medium: 50
+    high: 20
+
+  params:
+    low:
+      element_categories_min: 1
+      element_categories_max: 2
+      modifier_count_min: 0
+      modifier_count_max: 1
+      text_length_max: 20
+      challenge_count: 0
+    medium:
+      element_categories_min: 3
+      element_categories_max: 5
+      modifier_count_min: 2
+      modifier_count_max: 4
+      text_length_min: 20
+      text_length_max: 40
+      challenge_count_min: 1
+      challenge_count_max: 3
+    high:
+      element_categories_min: 4
+      element_categories_max: 4
+      modifier_count_min: 4
+      modifier_count_max: 8
+      text_length_min: 40
+      challenge_count_min: 3
+      challenge_count_max: 6
+
+# LLM配置
+llm:
+  providers:
+    qwen:
+      model: "qwen-max"
+      api_key_env: "DASHSCOPE_API_KEY"
+      base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    gemini:
+      model: "gemini-2.5-pro"
+      api_key_env: "GEMINI_API_KEY"
+      service_account_path: "../llm/llm-64897-gemini-79099acd0672.json"
+    gpt:
+      api_type: "azure"
+      model: "mmu-aigc-5-openai-eastus2-gpt-4o"
+      deployment_name: "mmu-aigc-5-openai-eastus2-gpt-4o"
+      api_key_env: "GPT4O_API_KEY"
+      azure_endpoint: "https://mmu-aigc-5-openai-eastus2.openai.azure.com/"
+      api_version: "2025-01-01-preview"
+      max_tokens: 8192
+      temperature: 0.7
+    dpsk:
+      model: "ep_ile8mup7w_ds-v3"
+      api_key_env: "DPSK_V3_API_KEY"
+      base_url: "https://qianfan.baidubce.com/v2"
+      default_headers:
+        appid: "app-iU6P4xuv"
+      max_tokens: 8192
+      temperature: 0.7
+
+# 输出配置
+output:
+  format: "json"
+  single_file: true
+  path: "output/dpsk_prompts.json"
+  include_stats: true
+
+# LLM-as-Judge 配置
+judge:
+  provider: "glm"
+  base_url: "https://cloud.infini-ai.com/maas/coding/v1"
+  model: "glm-5.1"
+  api_key_env: "GLM_JUDGE_API_KEY"
+  temperature: 0
+  max_tokens: 65536
+  timeout: 300
+  max_retries: 3
+  max_context_tokens: 200000
+  target_context_fraction: 0.4
+  max_prompts_per_batch: 0  # 0 means only token budget limits batch size
+  resume: true
+  save_raw_response: true
+  judge_version: "v1_concept_clarity_consistency"
+  output_dir: "reports/judge"
+  sample:
+    size_per_file: 50
+    strategy: "stratified_by_difficulty"
+    seed: 42
+  input_files:
+    - path: "output/gemini_prompts.json"
+      model_label: "gemini"
+    - path: "output/gpt4o_prompts.json"
+      model_label: "gpt4o"
+    - path: "output/dpsk_prompts.json"
+      model_label: "dpsk"
+
+# Challenge Elements
+challenge_elements:
+  - id: temporal_complexity
+    name: "Temporal Complexity"
+    description: "Sequential action chains, motion transitions, multi-stage processes"
+  - id: multi_subject
+    name: "Multi-Subject"
+    description: "Multiple independent subjects with coordinated or independent motion"
+  - id: physics
+    name: "Physics Simulation"
+    description: "Gravity, collision, fluid dynamics, deformation, light and shadow physics"
+  - id: interaction
+    name: "Interaction"
+    description: "Physical or semantic interaction between subjects"
+  - id: motion_amplitude
+    name: "Motion Amplitude"
+    description: "Large-scale motion, rapid movement, complex trajectories"
+  - id: multi_shot
+    name: "Multi-Shot Sequence"
+    description: "Camera angle changes, push/pull/pan/tilt movements"
+  - id: occlusion_depth
+    name: "Occlusion & Depth"
+    description: "Foreground/background relationships, partial occlusion, perspective"
+  - id: causal_chain
+    name: "Causal Chain"
+    description: "Chain reaction where A causes B causes C"
+  - id: material_change
+    name: "Material Transformation"
+    description: "State changes, deformation, fragmentation"
+  - id: anti_commonsense
+    name: "Anti-Commonsense / Edge Cases"
+    description: "Boundary conditions that violate physics or common sense"
