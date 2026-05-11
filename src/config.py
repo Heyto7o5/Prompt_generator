@@ -82,8 +82,30 @@ class Config:
         ])
 
     @property
+    def concept_selection_method(self) -> str:
+        """Concept selection strategy.
+
+        - semantic_topk: LLM selects compatible level-2 and real level-3 concepts.
+        - level2: legacy flow, LLM selects level-2 and system expands level-3.
+        """
+        method = self.get('core_sampling.selection_method')
+        if not method:
+            # Backward compatibility for old config files.
+            old_mode = self.get('core_sampling.sampling_mode', 'semantic_topk')
+            method = 'level2' if old_mode == 'core_concept' else old_mode
+        method = str(method).strip().lower()
+        aliases = {
+            'semantic': 'semantic_topk',
+            'semantic_topk_level2_level3': 'semantic_topk',
+            'core_concept': 'level2',
+            'llm_level2': 'level2',
+        }
+        return aliases.get(method, method)
+
+    @property
     def sampling_mode(self) -> str:
-        return self.get('core_sampling.sampling_mode', 'core_concept')
+        """Deprecated compatibility alias."""
+        return self.concept_selection_method
 
     @property
     def core_sampling_batch_size(self) -> int:
@@ -106,8 +128,8 @@ class Config:
         return self.get('core_sampling.level3_mode', 'traverse')
 
     @property
-    def num_dimensions_per_combo(self) -> int:
-        return self.get('core_sampling.num_dimensions_per_combo', 3)
+    def semantic_level3_per_level2(self) -> int:
+        return max(1, int(self.get('core_sampling.semantic_topk.level3_per_level2', 10)))
 
 
 def load_config(config_path: str = "config.yaml") -> Config:

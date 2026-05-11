@@ -12,7 +12,6 @@ import argparse
 import json
 import sys
 from collections import OrderedDict
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -28,6 +27,7 @@ from src.judge import (
     write_judge_report,
 )
 from src.models import SampledConcept
+from src.output import OutputWriter
 
 
 PASS_DECISIONS = {"PASS", "PASS_WITH_MINOR_ISSUES"}
@@ -337,10 +337,15 @@ def reconstruct_combination(prompt: Dict[str, Any], difficulty_manager: Difficul
 
 
 def sampled_concept_from_dict(category: str, data: Dict[str, Any]) -> SampledConcept:
+    raw_path = data.get("path")
     full_path = data.get("full_path") or ""
-    if full_path:
-        level3_path = [part.strip() for part in full_path.split(">")]
+    if isinstance(raw_path, list) and raw_path:
+        level3_path = [str(part).strip() for part in raw_path]
     else:
+        level3_path = []
+    if not level3_path and full_path:
+        level3_path = [part.strip() for part in full_path.split(">")]
+    if not level3_path:
         level3_path = [
             data.get("level1_category", ""),
             data.get("level2_category", ""),
@@ -490,8 +495,8 @@ Input:
 Required output schema:
 {{
   "selected_concepts": {{
-    "subject": {{"level1_category": "...", "level2_category": "...", "level3_category": "...", "full_path": "...", "leaf": null}},
-    "motion": {{"level1_category": "...", "level2_category": "...", "level3_category": "...", "full_path": "...", "leaf": "..."}}
+    "subject": {{"level1_category": "...", "level2_category": "...", "level3_category": "...", "path": ["...", "...", "..."], "leaf": null}},
+    "motion": {{"level1_category": "...", "level2_category": "...", "level3_category": "...", "path": ["...", "...", "..."], "leaf": "..."}}
   }},
   "reason": "brief reason"
 }}
@@ -604,7 +609,7 @@ def build_default_paths(
     judge_provider = judge_cfg.get("provider", "glm")
     judge_version = judge_cfg.get("judge_version", "v1")
     judge_model_label = merged_output.stem.replace("_prompts", "")
-    carryover = judge_dir / f"{judge_model_label}_{judge_provider}_{judge_version}.json"
+    carryover = judge_dir / f"{judge_model_label}_{judge_provider}_{judge_version}" / "full.json"
     return {
         "regen_output": regen_output,
         "merged_output": merged_output,
@@ -613,15 +618,11 @@ def build_default_paths(
 
 
 def write_prompt_file(path: Path, prompts: List[Dict[str, Any]], metadata: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = {
-        "generated_at": datetime.now().isoformat(),
-        "total_prompts": len(prompts),
-        "metadata": metadata,
-        "prompts": prompts,
-    }
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    writer = OutputWriter(str(path))
+    for prompt in prompts:
+        writer.add_prompt(prompt)
+    writer.set_stats({"metadata": metadata})
+    writer.write()
 
 
 def load_json(path: Path) -> Dict[str, Any]:
@@ -637,8 +638,13 @@ def resolve_path(path: str | Path) -> Path:
 
 
 def concept_key(concept: Dict[str, Any]) -> str:
+    path = concept.get("path")
+    if isinstance(path, list):
+        path_key = " > ".join(str(part) for part in path)
+    else:
+        path_key = str(concept.get("full_path", ""))
     return "|".join([
-        str(concept.get("full_path", "")),
+        path_key,
         str(concept.get("level3_category", "")),
         str(concept.get("leaf", "")),
     ])

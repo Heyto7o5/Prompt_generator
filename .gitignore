@@ -17,11 +17,9 @@ __pycache__/
 # Generated run state and outputs
 data/*.xlsx
 data/*coverage_state*.json
-output/*.json
-output/*.png
-output/*.jpg
+data/coverage/
+output/**
 reports/
 
 # Temporary rollout/debug artifacts
-output/rollout_*.json
 data/rollout_*.json

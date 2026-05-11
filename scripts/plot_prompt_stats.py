@@ -6,8 +6,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 # Matplotlib defaults to ~/.matplotlib, which may be unavailable in sandboxed runs.
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/prompt_generator_matplotlib")
@@ -18,6 +22,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
+
+from src.text_metrics import count_chinese_chars
 
 
 DIFFICULTY_ORDER = ["LOW", "MEDIUM", "HIGH"]
@@ -75,11 +81,10 @@ def load_prompts(path: Path, default_model: str) -> List[Dict]:
         display_model = model_display_name(provider, model_name, default_model)
 
         sampling = prompt.get("sampling", {}) or {}
-        categories = sampling.get("categories_selected") or list(
-            (sampling.get("concepts") or {}).keys()
-        )
-        challenges = sampling.get("challenge_elements") or []
-        text = prompt.get("text") or ""
+        concepts = prompt.get("concepts") or sampling.get("concepts") or {}
+        categories = sampling.get("categories_selected") or list(concepts.keys())
+        challenges = prompt.get("challenge_elements") or sampling.get("challenge_elements") or []
+        text = prompt.get("text") or prompt.get("prompt") or ""
         difficulty = (prompt.get("difficulty", {}) or {}).get("level", "UNKNOWN")
         difficulty = str(difficulty).upper()
 
@@ -91,7 +96,7 @@ def load_prompts(path: Path, default_model: str) -> List[Dict]:
                 "prompt_id": prompt.get("prompt_id"),
                 "combination_id": prompt.get("combination_id"),
                 "difficulty": difficulty,
-                "text_length": len(text.split()),
+                "text_length": count_chinese_chars(text),
                 "dimension_count": len(categories),
                 "challenge_count": len(challenges),
             }
@@ -108,7 +113,6 @@ def model_display_name(provider: str, model_name: str, default_model: str) -> st
     if provider == "dpsk" or "dpsk" in model_text or "deepseek" in model_text or "ds-v3" in model_text:
         return "DPSK"
     return default_model
-
 
 def format_autopct(values: Iterable[int]):
     total = sum(values)

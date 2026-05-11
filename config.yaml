@@ -26,18 +26,22 @@ dimensions:
 # 生成配置
 generation:
   active_llms:
-    - dpsk
+    - gemini
+  # 0 表示不设上限，按覆盖优先流程生成到阶段结束。
   max_prompts: 0
 
 # 核心概念驱动采样配置
 core_sampling:
-  sampling_mode: "core_concept"
+  # semantic_topk: LLM 同时选择兼容的二级与真实三级概念，推荐主流程。
+  # level2: 保留旧流程，LLM 只选二级，系统在二级下覆盖优先展开三级。
+  selection_method: "semantic_topk"
   batch_size: 10
-  coverage_state_path: "data/dpsk_coverage_state.json"
-  selection_llm_provider: "dpsk"  # 阶段一二级类目选择也使用 dpsk-v3
+  coverage_state_path: "data/coverage/gemini_3.0_semantic_v1_coverage_state.json"
+  selection_llm_provider: "gemini"
   max_retries: 2
-  level3_mode: "traverse"         # "traverse" | "llm_select"
-  num_dimensions_per_combo: 4     # 阶段一每个组合选几个维度
+  semantic_topk:
+    # 每个候选二级下最多给 LLM 的三级候选数。候选二级数量由类目树规模自动估算。
+    level3_per_level2: 10
 
 # 难度配置
 difficulty:
@@ -57,13 +61,16 @@ difficulty:
       element_categories_max: 2
       modifier_count_min: 0
       modifier_count_max: 1
+      # 文本长度按中文汉字数统计。
+      text_length_min: 1
       text_length_max: 20
       challenge_count: 0
     medium:
       element_categories_min: 3
-      element_categories_max: 5
+      element_categories_max: 3
       modifier_count_min: 2
       modifier_count_max: 4
+      # 文本长度按中文汉字数统计。
       text_length_min: 20
       text_length_max: 40
       challenge_count_min: 1
@@ -73,6 +80,7 @@ difficulty:
       element_categories_max: 4
       modifier_count_min: 4
       modifier_count_max: 8
+      # 文本长度按中文汉字数统计。
       text_length_min: 40
       challenge_count_min: 3
       challenge_count_max: 6
@@ -85,7 +93,7 @@ llm:
       api_key_env: "DASHSCOPE_API_KEY"
       base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
     gemini:
-      model: "gemini-2.5-pro"
+      model: "gemini-3-flash-preview"
       api_key_env: "GEMINI_API_KEY"
       service_account_path: "../llm/llm-64897-gemini-79099acd0672.json"
     gpt:
@@ -98,20 +106,25 @@ llm:
       max_tokens: 8192
       temperature: 0.7
     dpsk:
-      model: "ep_ile8mup7w_ds-v3"
-      api_key_env: "DPSK_V3_API_KEY"
+      model: "ep_awfrl3i74_ds-r1"
+      api_key_env: "DPSK_R1_API_KEY"
       base_url: "https://qianfan.baidubce.com/v2"
       default_headers:
         appid: "app-iU6P4xuv"
-      max_tokens: 8192
+      max_tokens: 65536
       temperature: 0.7
 
 # 输出配置
 output:
-  format: "json"
-  single_file: true
-  path: "output/dpsk_prompts.json"
-  include_stats: true
+  # path 写极简阅读版：只包含 prompt_id、concepts、prompt。
+  # 完整 review 版会自动写到同名 *_review.json，用于 judge/review/断点续跑。
+  path: "output/prompts/gemini_3.0_semantic_v1_prompts.json"
+
+# 结构化 prompt 重写配置
+structured_rewrite:
+  ratio: 0.3
+  seed: 42
+  provider: ""  # 留空则自动选择可用 LLM；可显式填 gpt/gemini/dpsk/qwen
 
 # LLM-as-Judge 配置
 judge:
@@ -124,7 +137,8 @@ judge:
   timeout: 300
   max_retries: 3
   max_context_tokens: 200000
-  target_context_fraction: 0.4
+  target_context_fraction: 0.05
+  target_input_tokens: 10000
   max_prompts_per_batch: 0  # 0 means only token budget limits batch size
   resume: true
   save_raw_response: true
@@ -135,42 +149,38 @@ judge:
     strategy: "stratified_by_difficulty"
     seed: 42
   input_files:
-    - path: "output/gemini_prompts.json"
-      model_label: "gemini"
-    - path: "output/gpt4o_prompts.json"
-      model_label: "gpt4o"
-    - path: "output/dpsk_prompts.json"
-      model_label: "dpsk"
+    - path: "output/prompts/gemini_3.0_semantic_v1_prompts.json"
+      model_label: "gemini_3.0_semantic_v1"
 
 # Challenge Elements
 challenge_elements:
   - id: temporal_complexity
     name: "Temporal Complexity"
-    description: "Sequential action chains, motion transitions, multi-stage processes"
+    description: "连续动作链、动作状态转换、多阶段过程或明显的时间推进"
   - id: multi_subject
     name: "Multi-Subject"
-    description: "Multiple independent subjects with coordinated or independent motion"
+    description: "多个独立主体同时出现，并产生协同、对比或各自独立的动作"
   - id: physics
     name: "Physics Simulation"
-    description: "Gravity, collision, fluid dynamics, deformation, light and shadow physics"
+    description: "重力、碰撞、流体、形变、光影变化等可观察的物理模拟"
   - id: interaction
     name: "Interaction"
-    description: "Physical or semantic interaction between subjects"
+    description: "主体之间发生物理接触、动作回应、因果影响或语义互动"
   - id: motion_amplitude
     name: "Motion Amplitude"
-    description: "Large-scale motion, rapid movement, complex trajectories"
+    description: "大幅度动作、高速移动、明显位移或复杂运动轨迹"
   - id: multi_shot
     name: "Multi-Shot Sequence"
-    description: "Camera angle changes, push/pull/pan/tilt movements"
+    description: "多镜头或镜头运动，如视角变化、推拉、平移、摇移或切换"
   - id: occlusion_depth
     name: "Occlusion & Depth"
-    description: "Foreground/background relationships, partial occlusion, perspective"
+    description: "前后景关系、局部遮挡、空间透视、景深层次或远近关系"
   - id: causal_chain
     name: "Causal Chain"
-    description: "Chain reaction where A causes B causes C"
+    description: "一个事件触发另一个事件，形成清晰的连续因果链"
   - id: material_change
     name: "Material Transformation"
-    description: "State changes, deformation, fragmentation"
+    description: "材质、形态或状态发生变化，如变形、破碎、融化、凝结、扩散"
   - id: anti_commonsense
     name: "Anti-Commonsense / Edge Cases"
-    description: "Boundary conditions that violate physics or common sense"
+    description: "反常识或边界情形，包含违背常规物理、尺度、语义预期的特殊设定"

@@ -26,9 +26,25 @@ class CoverageTracker:
 
     EXCLUDE_KEYWORDS = ['其他', '其它', 'Other', 'other']
 
-    def __init__(self, loader: ConceptLoader, state_path: str = "data/coverage_state.json"):
+    def __init__(
+        self,
+        loader: ConceptLoader,
+        state_path: str = "data/coverage_state.json",
+        dimensions_config: Optional[List[Dict[str, Any]]] = None,
+    ):
         self.loader = loader
         self.state_path = Path(state_path)
+        self.category_key_to_sheet = {
+            item.get('key'): item.get('sheet')
+            for item in (dimensions_config or [])
+            if item.get('key') and item.get('sheet')
+        }
+        self.category_key_to_sheet.update({
+            'subject': self.category_key_to_sheet.get('subject', '主体'),
+            'motion': self.category_key_to_sheet.get('motion', '运动'),
+            'scene': self.category_key_to_sheet.get('scene', '场景'),
+            'audio': self.category_key_to_sheet.get('audio', '音频类型'),
+        })
         self.state: Dict[str, Dict[str, Level3CoverageRecord]] = {}
         self._init_from_loader()
         self._load_state()
@@ -207,7 +223,8 @@ class CoverageTracker:
         self.reset()
         for prompt in prompts:
             records = []
-            concepts = prompt.get('sampling', {}).get('concepts', {})
+            sampling = prompt.get('sampling', {})
+            concepts = prompt.get('concepts') or sampling.get('concepts', {})
             categories = list(concepts.keys())
             core_category = categories[0] if categories else None
             for category_key, concept in concepts.items():
@@ -225,13 +242,7 @@ class CoverageTracker:
             self.save()
 
     def _category_key_to_sheet(self, category_key: str) -> Optional[str]:
-        mapping = {
-            'subject': '主体',
-            'motion': '运动',
-            'scene': '场景',
-            'audio': '音频类型',
-        }
-        return mapping.get(category_key)
+        return self.category_key_to_sheet.get(category_key)
 
     # ── 报告 ──────────────────────────────────────────
 

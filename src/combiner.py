@@ -2,10 +2,10 @@
 类目组合与难度分配模块
 """
 import random
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Union
 from dataclasses import dataclass
 from .challenge_sampler import ChallengeSampler
-from .models import SampledConcept
+from .models import SampledCombination, SampledConcept
 
 
 @dataclass
@@ -66,6 +66,8 @@ class PromptCombination:
     difficulty_level: str
     difficulty_params: DifficultyParams
     challenge_elements: List[Dict]
+    selection_trace: Dict[str, Any] = None
+    phase: str = "phase1"
     
     def to_dict(self) -> Dict:
         """转换为字典"""
@@ -92,9 +94,16 @@ class PromptCombination:
                 }
             },
             'challenge_elements': [
-                {'id': elem['id'], 'name': elem['name']}
+                {
+                    'id': elem.get('id'),
+                    'name': elem.get('name'),
+                    'description': elem.get('description', ''),
+                    'reason': elem.get('reason', ''),
+                }
                 for elem in self.challenge_elements
-            ]
+            ],
+            'selection_trace': self.selection_trace or {},
+            'phase': self.phase,
         }
 
 
@@ -107,27 +116,41 @@ class Combiner:
         self.combination_counter = 0
 
     def create_combination_from_core_selection(
-        self, sampled_concepts: Dict[str, SampledConcept], difficulty_level: Optional[str] = None
+        self,
+        sampled_concepts: Union[Dict[str, SampledConcept], SampledCombination],
+        difficulty_level: Optional[str] = None
     ) -> PromptCombination:
         """Create a prompt combination from core-concept sampler output."""
         difficulty_level = difficulty_level or 'medium'
         difficulty_params = self.difficulty_manager.get_params(difficulty_level)
 
-        challenge_count = random.randint(
-            difficulty_params.challenge_count_min,
-            max(difficulty_params.challenge_count_min, difficulty_params.challenge_count_max)
-        )
-        challenge_elements = self.challenge_sampler.sample(challenge_count)
+        selection_trace = {}
+        phase = "phase1"
+        if isinstance(sampled_concepts, SampledCombination):
+            concepts = sampled_concepts.concepts
+            challenge_elements = sampled_concepts.challenge_elements
+            selection_trace = sampled_concepts.selection_trace
+            phase = sampled_concepts.phase
+            self.challenge_sampler.record(challenge_elements)
+        else:
+            concepts = sampled_concepts
+            challenge_count = random.randint(
+                difficulty_params.challenge_count_min,
+                max(difficulty_params.challenge_count_min, difficulty_params.challenge_count_max)
+            )
+            challenge_elements = self.challenge_sampler.sample(challenge_count)
 
         self.combination_counter += 1
         combination_id = f"C-{self.combination_counter:05d}"
 
         return PromptCombination(
             combination_id=combination_id,
-            concepts=sampled_concepts,
+            concepts=concepts,
             difficulty_level=difficulty_level,
             difficulty_params=difficulty_params,
-            challenge_elements=challenge_elements
+            challenge_elements=challenge_elements,
+            selection_trace=selection_trace,
+            phase=phase,
         )
 
     def get_stats(self) -> Dict[str, Any]:

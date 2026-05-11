@@ -18,13 +18,11 @@ def main(config_path: str = "config.yaml", dry_run: bool = False):
 
     print("\n[1/6] 加载配置...")
     config = load_config(config_path)
-    print(f"  - 采样模式: {config.sampling_mode}")
+    print(f"  - 概念选择方法: {config.concept_selection_method}")
     print(f"  - Dry-run: {dry_run}")
 
-    if config.sampling_mode != 'core_concept':
-        raise ValueError(
-            "旧 template/V1 流程已删除，请将 core_sampling.sampling_mode 设置为 core_concept"
-        )
+    if config.concept_selection_method not in {'semantic_topk', 'level2'}:
+        raise ValueError("core_sampling.selection_method 只支持 semantic_topk 或 level2")
 
     run_core_concept_pipeline(config, dry_run)
 

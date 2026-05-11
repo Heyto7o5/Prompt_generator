@@ -34,5 +34,12 @@ class ChallengeSampler:
 
         return selected
 
+    def record(self, elements: List[Dict]) -> None:
+        """Record LLM-selected challenge elements for coverage statistics."""
+        for elem in elements:
+            elem_id = elem.get('id')
+            if elem_id in self.sampled_count:
+                self.sampled_count[elem_id] += 1
+
     def get_distribution(self) -> Dict[str, int]:
         return self.sampled_count.copy()

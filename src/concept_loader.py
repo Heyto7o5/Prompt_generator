@@ -42,8 +42,9 @@ class ConceptLoader:
     
     SHEET_NAMES = ['主体', '运动', '场景', '音频类型']
     
-    def __init__(self, xlsx_path: str):
+    def __init__(self, xlsx_path: str, sheet_names: Optional[List[str]] = None):
         self.xlsx_path = Path(xlsx_path)
+        self.sheet_names = sheet_names or list(self.SHEET_NAMES)
         self.workbook = None
         self.categories: Dict[str, CategorySheet] = {}
     
@@ -54,7 +55,7 @@ class ConceptLoader:
         
         self.workbook = openpyxl.load_workbook(self.xlsx_path, read_only=True)
         
-        for sheet_name in self.SHEET_NAMES:
+        for sheet_name in self.sheet_names:
             if sheet_name in self.workbook.sheetnames:
                 self.categories[sheet_name] = self._parse_sheet(sheet_name)
         
@@ -171,8 +172,8 @@ class ConceptLoader:
         return stats
 
 
-def load_concepts(xlsx_path: str) -> ConceptLoader:
+def load_concepts(xlsx_path: str, sheet_names: Optional[List[str]] = None) -> ConceptLoader:
     """加载概念类目树的便捷函数"""
-    loader = ConceptLoader(xlsx_path)
+    loader = ConceptLoader(xlsx_path, sheet_names=sheet_names)
     loader.load()
     return loader

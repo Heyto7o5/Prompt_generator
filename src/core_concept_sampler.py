@@ -1,12 +1,13 @@
 """
 核心概念驱动采样器
-以未覆盖的 level3 为核心，LLM 批量选兼容二级，系统遍历三级保证覆盖
+以未覆盖的 level3 为核心，系统采样 companion 维度，LLM 选择兼容二级，
+系统在选中二级下覆盖优先采样真实三级。
 """
 import random
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from .concept_loader import ConceptLoader, ConceptNode
 from .coverage_tracker import CoverageTracker
-from .models import SampledConcept
+from .models import SampledCombination, SampledConcept
 from .selection_prompt import ConceptSelectionPromptBuilder
 
 
@@ -25,6 +26,7 @@ class CoreConceptDrivenSampler:
         num_dimensions: int = 3,
         max_retries: int = 2,
         level3_mode: str = 'traverse',
+        challenge_elements: Optional[List[Dict[str, Any]]] = None,
     ):
         """
         Args:
@@ -44,6 +46,7 @@ class CoreConceptDrivenSampler:
         self.num_dimensions = num_dimensions
         self.max_retries = max_retries
         self.level3_mode = level3_mode
+        self.challenge_elements = challenge_elements or []
 
         # 维度配置
         self.dimensions_config = sorted(dimensions_config, key=lambda d: d.get('core_priority', 99))
@@ -53,8 +56,8 @@ class CoreConceptDrivenSampler:
         # Prompt 构建器
         self.prompt_builder = ConceptSelectionPromptBuilder(loader, dimensions_config)
 
-        # 选择缓冲区：num_dimensions -> [{core_dim_key, core_concept, selections}]
-        self._combination_buffers: Dict[int, List[Dict]] = {}
+        # 选择缓冲区：(num_dimensions, target_challenge_count) -> items
+        self._combination_buffers: Dict[Tuple[int, int], List[Dict]] = {}
 
         # 当前核心维度
         self._current_core_dim = self._get_next_core_dim()
@@ -77,19 +80,25 @@ class CoreConceptDrivenSampler:
         return None
 
     def sample_combination(
-        self, num_dimensions: Optional[int] = None
-    ) -> Optional[Dict[str, SampledConcept]]:
+        self,
+        num_dimensions: Optional[int] = None,
+        target_challenge_count: int = 0,
+    ) -> Optional[SampledCombination]:
         """获取下一个组合。缓冲区空时自动通过 LLM 补充。
 
         Returns:
-            Dict[str, SampledConcept] 或 None（全部覆盖完成）
+            SampledCombination 或 None（全部覆盖完成）
         """
         requested_num_dimensions = self._normalize_num_dimensions(num_dimensions)
-        buffer = self._combination_buffers.setdefault(requested_num_dimensions, [])
+        buffer_key = (requested_num_dimensions, max(0, target_challenge_count))
+        buffer = self._combination_buffers.setdefault(buffer_key, [])
 
         if not buffer:
-            self._refill_buffer(num_dimensions=requested_num_dimensions)
-            buffer = self._combination_buffers.setdefault(requested_num_dimensions, [])
+            self._refill_buffer(
+                num_dimensions=requested_num_dimensions,
+                target_challenge_count=target_challenge_count,
+            )
+            buffer = self._combination_buffers.setdefault(buffer_key, [])
 
         if not buffer:
             return None
@@ -97,10 +106,39 @@ class CoreConceptDrivenSampler:
         item = buffer.pop(0)
         return self._to_sampled_concepts(item)
 
-    def _refill_buffer(self, num_dimensions: Optional[int] = None):
+    def sample_combination_from_anchor_pool(
+        self,
+        anchor_pool: Dict[str, List[ConceptNode]],
+        num_dimensions: Optional[int] = None,
+        target_challenge_count: int = 0,
+    ) -> Optional[SampledCombination]:
+        """阶段二：从已覆盖概念池选 anchor，再让 LLM 选择兼容 companion。"""
+        available_dims = [dim for dim, nodes in anchor_pool.items() if nodes]
+        if not available_dims:
+            return None
+
+        anchor_dim = random.choice(available_dims)
+        anchor_node = random.choice(anchor_pool[anchor_dim])
+        requested_num_dimensions = self._normalize_num_dimensions(num_dimensions)
+        return self._sample_from_core_nodes(
+            core_dim_key=anchor_dim,
+            core_concepts=[anchor_node],
+            num_dimensions=requested_num_dimensions,
+            target_challenge_count=target_challenge_count,
+            phase='phase2',
+            mark_core_covered=True,
+            include_fully_covered_candidates=True,
+        )
+
+    def _refill_buffer(
+        self,
+        num_dimensions: Optional[int] = None,
+        target_challenge_count: int = 0,
+    ):
         """通过 LLM 批量选二级，然后遍历三级填充缓冲区"""
         requested_num_dimensions = self._normalize_num_dimensions(num_dimensions)
-        buffer = self._combination_buffers.setdefault(requested_num_dimensions, [])
+        buffer_key = (requested_num_dimensions, max(0, target_challenge_count))
+        buffer = self._combination_buffers.setdefault(buffer_key, [])
 
         # 确定核心维度
         self._current_core_dim = self._get_next_core_dim()
@@ -114,35 +152,136 @@ class CoreConceptDrivenSampler:
         if not core_concepts:
             return
 
-        # 确定目标维度（排除核心维度，取 num_dimensions-1 个同伴维度）
-        target_dims = self._get_target_dimensions(num_dimensions=num_dimensions)
-        if not target_dims:
-            self._append_core_only(core_concepts, core_sheet, buffer)
-            return
+        items = self._build_items_from_core_nodes(
+            core_dim_key=self._current_core_dim,
+            core_concepts=core_concepts,
+            num_dimensions=requested_num_dimensions,
+            target_challenge_count=target_challenge_count,
+            phase='phase1',
+            mark_core_covered=True,
+            include_fully_covered_candidates=False,
+        )
+        buffer.extend(items)
+
+    def _sample_from_core_nodes(
+        self,
+        core_dim_key: str,
+        core_concepts: List[ConceptNode],
+        num_dimensions: int,
+        target_challenge_count: int,
+        phase: str,
+        mark_core_covered: bool,
+        include_fully_covered_candidates: bool,
+    ) -> Optional[SampledCombination]:
+        items = self._build_items_from_core_nodes(
+            core_dim_key=core_dim_key,
+            core_concepts=core_concepts,
+            num_dimensions=num_dimensions,
+            target_challenge_count=target_challenge_count,
+            phase=phase,
+            mark_core_covered=mark_core_covered,
+            include_fully_covered_candidates=include_fully_covered_candidates,
+        )
+        if not items:
+            return None
+        return self._to_sampled_concepts(items[0])
+
+    def _build_items_from_core_nodes(
+        self,
+        core_dim_key: str,
+        core_concepts: List[ConceptNode],
+        num_dimensions: int,
+        target_challenge_count: int,
+        phase: str,
+        mark_core_covered: bool,
+        include_fully_covered_candidates: bool,
+    ) -> List[Dict]:
+        """系统采样 companion 维度，LLM 基于指定维度选择二级类目和 challenge。"""
+        requested_num_dimensions = self._normalize_num_dimensions(num_dimensions)
+        target_companion_count = max(0, requested_num_dimensions - 1)
+        core_sheet = self.key_to_sheet[core_dim_key]
+        items: List[Dict] = []
+
+        candidate_dims = self._get_candidate_dimensions(core_dim_key)
+        if target_companion_count == 0 or not candidate_dims:
+            self._append_core_only(
+                core_concepts,
+                core_sheet,
+                items,
+                core_dim_key=core_dim_key,
+                phase=phase,
+                target_total_dimensions=requested_num_dimensions,
+            )
+            return items
 
         # 构建动态过滤后的可用二级列表
-        available_level2, covered_fallback_dims = self._build_level2_candidates(target_dims)
+        available_level2, covered_fallback_dims = self._build_level2_candidates(
+            candidate_dims,
+            include_fully_covered_candidates=include_fully_covered_candidates,
+        )
         if not any(available_level2.values()):
-            self._append_core_only(core_concepts, core_sheet, buffer)
-            return
+            self._append_core_only(
+                core_concepts,
+                core_sheet,
+                items,
+                core_dim_key=core_dim_key,
+                phase=phase,
+                target_total_dimensions=requested_num_dimensions,
+            )
+            return items
+
+        selected_candidate_dims = self._sample_companion_dimensions(
+            candidate_dims,
+            available_level2,
+            target_companion_count,
+        )
+        if not selected_candidate_dims:
+            self._append_core_only(
+                core_concepts,
+                core_sheet,
+                items,
+                core_dim_key=core_dim_key,
+                phase=phase,
+                target_total_dimensions=requested_num_dimensions,
+            )
+            return items
+
+        selected_available_level2 = {
+            dim_key: available_level2.get(dim_key, [])
+            for dim_key in selected_candidate_dims
+        }
+        actual_total_dimensions = 1 + len(selected_candidate_dims)
 
         # 构建并发 LLM prompt
         prompt = self.prompt_builder.build_batch_prompt(
-            core_dim_key=self._current_core_dim,
+            core_dim_key=core_dim_key,
             core_concepts=core_concepts,
-            available_level2=available_level2,
-            target_dimensions=target_dims,
+            available_level2=selected_available_level2,
+            candidate_dimensions=selected_candidate_dims,
+            target_total_dimensions=actual_total_dimensions,
+            challenge_elements=self.challenge_elements,
+            target_challenge_count=target_challenge_count,
         )
 
         # 调用 LLM（带重试）
         selections = None
+        response = ''
         for attempt in range(self.max_retries + 1):
             try:
                 response = self.llm.generate(prompt)
                 self.stats['llm_calls'] += 1
 
                 selections = self.prompt_builder.parse_batch_response(
-                    response, core_concepts, target_dims
+                    response,
+                    core_concepts,
+                    selected_candidate_dims,
+                    len(selected_candidate_dims),
+                    challenge_elements=self.challenge_elements,
+                    target_challenge_count=target_challenge_count,
+                )
+                selections = self.prompt_builder.filter_complete_selections(
+                    selections,
+                    selected_candidate_dims,
                 )
 
                 if selections:
@@ -154,14 +293,16 @@ class CoreConceptDrivenSampler:
 
         if not selections:
             # 全部重试失败，为每个核心概念创建只有核心维度的组合
-            self._append_core_only(core_concepts, core_sheet, buffer)
+            self._append_core_only(
+                core_concepts,
+                core_sheet,
+                items,
+                core_dim_key=core_dim_key,
+                phase=phase,
+                target_total_dimensions=requested_num_dimensions,
+            )
             self.stats['combinations_from_backfill'] += len(core_concepts)
-            return
-
-        # 补选缺失维度
-        selections = self.prompt_builder.fill_missing_selections(
-            selections, available_level2, target_dims
-        )
+            return items
 
         # 遍历二级下未覆盖的三级，展开为组合
         for sel in selections:
@@ -171,10 +312,28 @@ class CoreConceptDrivenSampler:
                 continue
 
             # 阶段一：仅更新内存覆盖，用于当前运行内避免重复采样。
-            self.coverage.mark_covered(core_sheet, core_name, as_core=True)
+            if mark_core_covered:
+                self.coverage.mark_covered(core_sheet, core_name, as_core=True)
+
+            selection_trace = self._build_selection_trace(
+                core_dim_key=core_dim_key,
+                core_node=core_node,
+                target_total_dimensions=actual_total_dimensions,
+                target_challenge_count=target_challenge_count,
+                candidate_dimensions=selected_candidate_dims,
+                available_level2=selected_available_level2,
+                prompt=prompt,
+                raw_response=response,
+                parsed_selection=sel,
+                phase=phase,
+            )
+            selection_trace['level3_selection'] = {
+                'policy': 'system_samples_real_level3_under_llm_selected_level2',
+                'reason': 'LLM 只选择整体兼容的二级组合；真实三级/叶子由系统在选中二级下覆盖优先采样。',
+            }
+            selected_challenges = sel.get('selected_challenges', [])
 
             if self.level3_mode == 'traverse':
-                # 遍历每个同伴维度下选定二级的未覆盖三级
                 companion_combos = self._traverse_companions(
                     sel,
                     fallback_dims=covered_fallback_dims,
@@ -182,41 +341,72 @@ class CoreConceptDrivenSampler:
 
                 if companion_combos:
                     for combo in companion_combos:
-                        buffer.append({
-                            'core_dim_key': self._current_core_dim,
+                        items.append({
+                            'core_dim_key': core_dim_key,
                             'core_concept': core_node,
                             'selections': combo,
+                            'selected_challenges': selected_challenges,
+                            'selection_trace': selection_trace,
+                            'phase': phase,
                         })
                         self.stats['combinations_generated'] += 1
                         if any(dim in covered_fallback_dims for dim in combo):
                             self.stats['combinations_with_companion_reuse'] += 1
                 else:
                     # 没有可遍历的三级，只有核心概念
-                    buffer.append({
-                        'core_dim_key': self._current_core_dim,
+                    items.append({
+                        'core_dim_key': core_dim_key,
                         'core_concept': core_node,
                         'selections': {},
+                        'selected_challenges': selected_challenges,
+                        'selection_trace': selection_trace,
+                        'phase': phase,
                     })
                     self.stats['combinations_generated'] += 1
             else:
                 # llm_select 模式：直接用 LLM 选的二级，随机取一个三级
                 combo = self._pick_random_level3_from_selections(sel)
-                buffer.append({
-                    'core_dim_key': self._current_core_dim,
+                items.append({
+                    'core_dim_key': core_dim_key,
                     'core_concept': core_node,
                     'selections': combo,
+                    'selected_challenges': selected_challenges,
+                    'selection_trace': selection_trace,
+                    'phase': phase,
                 })
                 self.stats['combinations_generated'] += 1
 
+        return items
+
     def _get_target_dimensions(self, num_dimensions: Optional[int] = None) -> List[str]:
-        """获取目标维度列表（排除核心维度）"""
+        """兼容旧接口：返回候选 companion 维度的前 N 个。"""
         total_dimensions = self._normalize_num_dimensions(num_dimensions)
-        companion_dims = [
-            d['key'] for d in self.dimensions_config
-            if d['key'] != self._current_core_dim and d.get('companion', True)
-        ]
-        # 限制维度数
+        companion_dims = self._get_candidate_dimensions(self._current_core_dim)
         return companion_dims[:total_dimensions - 1]
+
+    def _get_candidate_dimensions(self, core_dim_key: str) -> List[str]:
+        """获取所有候选 companion 维度（不再按难度提前截断）。"""
+        return [
+            d['key'] for d in self.dimensions_config
+            if d['key'] != core_dim_key and d.get('companion', True)
+        ]
+
+    def _sample_companion_dimensions(
+        self,
+        candidate_dims: List[str],
+        available_level2: Dict[str, List[str]],
+        target_companion_count: int,
+    ) -> List[str]:
+        """随机选择本条样本要使用的 companion 维度。"""
+        usable_dims = [
+            dim_key for dim_key in candidate_dims
+            if available_level2.get(dim_key)
+        ]
+        if target_companion_count <= 0 or not usable_dims:
+            return []
+
+        sampled_count = min(target_companion_count, len(usable_dims))
+        return random.sample(usable_dims, sampled_count)
 
     def _normalize_num_dimensions(self, num_dimensions: Optional[int] = None) -> int:
         total_dimensions = num_dimensions if num_dimensions is not None else self.num_dimensions
@@ -251,8 +441,13 @@ class CoreConceptDrivenSampler:
     def _build_level2_candidates(
         self,
         target_dims: List[str],
+        include_fully_covered_candidates: bool = False,
     ) -> Tuple[Dict[str, List[str]], Set[str]]:
         """优先使用未覆盖二级；维度已全覆盖时复用该维度二级作为上下文。"""
+        if include_fully_covered_candidates:
+            all_level2 = self._build_available_level2(target_dims, include_fully_covered=True)
+            return all_level2, {dim for dim, names in all_level2.items() if names}
+
         uncovered_level2 = self._build_available_level2(target_dims, include_fully_covered=False)
         all_level2 = None
         available: Dict[str, List[str]] = {}
@@ -278,14 +473,29 @@ class CoreConceptDrivenSampler:
         core_concepts: List[ConceptNode],
         core_sheet: str,
         buffer: List[Dict],
+        core_dim_key: Optional[str] = None,
+        phase: str = 'phase1',
+        target_total_dimensions: int = 1,
     ):
         """没有可用同伴时仍输出核心概念，避免覆盖推进被同伴维度卡住。"""
+        core_dim_key = core_dim_key or self._current_core_dim
         for concept in core_concepts:
             self.coverage.mark_covered(core_sheet, concept.name, as_core=True)
             buffer.append({
-                'core_dim_key': self._current_core_dim,
+                'core_dim_key': core_dim_key,
                 'core_concept': concept,
                 'selections': {},
+                'selected_challenges': [],
+                'phase': phase,
+                'selection_trace': {
+                    'phase': phase,
+                    'core': self._core_trace(core_dim_key, concept),
+                    'target_total_dimensions': target_total_dimensions,
+                    'target_challenge_count': 0,
+                    'llm_selection': None,
+                    'level3_selection': {'policy': 'core_only'},
+                    'system_expansion': {},
+                },
             })
             self.stats['combinations_generated'] += 1
 
@@ -434,9 +644,65 @@ class CoreConceptDrivenSampler:
                 return node
         return None
 
-    def _to_sampled_concepts(self, item: Dict) -> Dict[str, SampledConcept]:
-        """将内部组合转为 Dict[str, SampledConcept] 格式"""
-        result = {}
+    def _core_trace(self, core_dim_key: str, core_node: ConceptNode) -> Dict[str, Any]:
+        return {
+            'dimension': core_dim_key,
+            'sheet_name': self.key_to_sheet.get(core_dim_key, core_dim_key),
+            'level3': core_node.name,
+            'full_path': list(core_node.path),
+        }
+
+    def _build_selection_trace(
+        self,
+        core_dim_key: str,
+        core_node: ConceptNode,
+        target_total_dimensions: int,
+        target_challenge_count: int,
+        candidate_dimensions: List[str],
+        available_level2: Dict[str, List[str]],
+        prompt: str,
+        raw_response: str,
+        parsed_selection: Dict,
+        phase: str,
+    ) -> Dict[str, Any]:
+        """Build trace metadata for auditing LLM compatibility selection."""
+        return {
+            'phase': phase,
+            'core': self._core_trace(core_dim_key, core_node),
+            'target_total_dimensions': target_total_dimensions,
+            'target_challenge_count': target_challenge_count,
+            'candidate_dimensions': list(candidate_dimensions),
+            'selection_mode': 'system_sampled_dimensions_llm_selected_level2',
+            'available_level2_counts': {
+                dim_key: len(names)
+                for dim_key, names in available_level2.items()
+            },
+            'llm_selection': {
+                'provider': self.llm.__class__.__name__,
+                'model': getattr(self.llm, 'model', ''),
+                'prompt_char_length': len(prompt),
+                'raw_response': raw_response,
+                'selected_level2': {
+                    dim_key: payload.get('level2_name')
+                    for dim_key, payload in parsed_selection.get('selections', {}).items()
+                },
+                'selected_companions': parsed_selection.get('selected_companions', []),
+                'selected_challenges': parsed_selection.get('selected_challenges', []),
+                'combination_reason': parsed_selection.get('combination_reason', ''),
+                'raw_combination_reason': parsed_selection.get('raw_combination_reason', ''),
+                'reason_warnings': parsed_selection.get('reason_warnings', []),
+                'risk_flags': parsed_selection.get('risk_flags', []),
+                'confidence': parsed_selection.get('confidence', 0.5),
+                'note': parsed_selection.get('note', ''),
+                'validation': parsed_selection.get('validation', {}),
+            },
+            'level3_selection': {},
+            'system_expansion': {},
+        }
+
+    def _to_sampled_concepts(self, item: Dict) -> SampledCombination:
+        """将内部组合转为 SampledCombination 格式"""
+        result: Dict[str, SampledConcept] = {}
         core_dim = item['core_dim_key']
         core_node = item['core_concept']
         core_sheet = self.key_to_sheet[core_dim]
@@ -449,17 +715,36 @@ class CoreConceptDrivenSampler:
             leaf=self._pick_leaf(core_sheet, core_node.name),
         )
 
+        selection_trace = item.get('selection_trace', {}) or {}
+
         # 同伴概念
+        system_expansion = {}
         for dim_key, l3_node in item.get('selections', {}).items():
             sheet = self.key_to_sheet[dim_key]
+            leaf = self._pick_leaf(sheet, l3_node.name)
             result[dim_key] = SampledConcept(
                 sheet_name=sheet,
                 level3_category=l3_node.name,
                 level3_path=list(l3_node.path),
-                leaf=self._pick_leaf(sheet, l3_node.name),
+                leaf=leaf,
             )
+            system_expansion[dim_key] = {
+                'selected_level3': l3_node.name,
+                'selected_leaf': leaf,
+                'level3_path': list(l3_node.path),
+                'policy': 'coverage_priority_random_under_llm_selected_level2'
+                if self.level3_mode == 'traverse'
+                else 'random_under_selected_level2',
+            }
 
-        return result
+        selection_trace['system_expansion'] = system_expansion
+
+        return SampledCombination(
+            concepts=result,
+            challenge_elements=item.get('selected_challenges', []),
+            selection_trace=selection_trace,
+            phase=item.get('phase', 'phase1'),
+        )
 
     def _pick_leaf(self, sheet_name: str, level3_name: str) -> Optional[str]:
         """从三级类目下随机选一个叶子节点"""

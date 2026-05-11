@@ -13,8 +13,10 @@ from .concept_loader import load_concepts
 from .core_concept_sampler import CoreConceptDrivenSampler
 from .coverage_tracker import CoverageTracker
 from .generator import PromptGenerator
-from .models import SampledConcept
-from .output import OutputWriter, StatsCollector
+from .models import SampledCombination, SampledConcept
+from .output import OutputWriter, StatsCollector, derive_review_output_path
+from .semantic_topk_sampler import SemanticTopKSampler, derive_semantic_topk_params
+from .text_metrics import count_chinese_chars
 
 
 class CoreConceptPipeline:
@@ -25,10 +27,17 @@ class CoreConceptPipeline:
         self.dry_run = dry_run
 
         print("  [Init] Loading concept taxonomy...")
-        self.loader = load_concepts(self.config.concept_tree_path)
+        self.loader = load_concepts(
+            self.config.concept_tree_path,
+            sheet_names=[item['sheet'] for item in self.config.dimensions if item.get('sheet')],
+        )
 
         print("  [Init] Initializing coverage tracker...")
-        self.coverage = CoverageTracker(self.loader, config.coverage_state_path)
+        self.coverage = CoverageTracker(
+            self.loader,
+            config.coverage_state_path,
+            dimensions_config=config.dimensions,
+        )
         report = self.coverage.get_report()
         for sheet, info in report['sheets'].items():
             print(
@@ -39,17 +48,8 @@ class CoreConceptPipeline:
         print("  [Init] Initializing LLM provider for concept selection...")
         self.llm_for_selection = self._get_mock_llm() if dry_run else self._get_llm_provider()
 
-        print("  [Init] Initializing core concept sampler...")
-        self.core_sampler = CoreConceptDrivenSampler(
-            loader=self.loader,
-            llm_provider=self.llm_for_selection,
-            coverage_tracker=self.coverage,
-            dimensions_config=config.dimensions,
-            batch_size=config.core_sampling_batch_size,
-            num_dimensions=config.num_dimensions_per_combo,
-            max_retries=config.core_sampling_max_retries,
-            level3_mode=config.level3_mode,
-        )
+        print("  [Init] Initializing concept sampler...")
+        self.core_sampler = self._build_sampler()
 
         self.challenge_sampler = ChallengeSampler(self.config.challenge_elements)
         self.difficulty_manager = DifficultyManager(
@@ -60,7 +60,59 @@ class CoreConceptPipeline:
 
         if not self.dry_run:
             print("  [Init] Initializing LLM generator for prompt text...")
-            self.generator = PromptGenerator(self.config.llm_providers, self.config.active_llms)
+            self.generator = PromptGenerator(
+                self.config.llm_providers,
+                self.config.active_llms,
+                dimensions_config=self.config.dimensions,
+            )
+
+    def _build_sampler(self):
+        method = self.config.concept_selection_method
+        if method == 'semantic_topk':
+            params = derive_semantic_topk_params(
+                self.loader,
+                self.config.dimensions,
+                level3_candidate_count_per_level2=self.config.semantic_level3_per_level2,
+            )
+            print(
+                "    selection_method=semantic_topk "
+                f"(level3_per_level2={params.level3_candidate_count_per_level2})"
+            )
+            for dim_key, count in params.level2_candidate_count_by_dim.items():
+                stats = params.stats_by_dim.get(dim_key, {})
+                print(
+                    f"    {dim_key}: level2_topM={count}, "
+                    f"level2_total={stats.get('level2_count')}, "
+                    f"level3_total={stats.get('level3_count')}"
+                )
+            return SemanticTopKSampler(
+                loader=self.loader,
+                llm_provider=self.llm_for_selection,
+                coverage_tracker=self.coverage,
+                dimensions_config=self.config.dimensions,
+                params=params,
+                batch_size=self.config.core_sampling_batch_size,
+                max_retries=self.config.core_sampling_max_retries,
+                challenge_elements=self.config.challenge_elements,
+            )
+
+        if method == 'level2':
+            print("    selection_method=level2 (LLM selects level-2; system expands level-3)")
+            return CoreConceptDrivenSampler(
+                loader=self.loader,
+                llm_provider=self.llm_for_selection,
+                coverage_tracker=self.coverage,
+                dimensions_config=self.config.dimensions,
+                batch_size=self.config.core_sampling_batch_size,
+                max_retries=self.config.core_sampling_max_retries,
+                level3_mode=self.config.level3_mode,
+                challenge_elements=self.config.challenge_elements,
+            )
+
+        raise ValueError(
+            "不支持的 core_sampling.selection_method: "
+            f"{method}. 可选值: semantic_topk, level2"
+        )
 
     def _get_llm_provider(self):
         from .generator import DpskProvider, GeminiProvider, GPTProvider, QwenProvider
@@ -94,46 +146,64 @@ class CoreConceptPipeline:
 
         class MockLLM:
             def generate(self, prompt):
+                semantic_match = re.search(r"## 候选池 JSON\s*(\{.*\})\s*$", prompt, re.DOTALL)
+                if semantic_match:
+                    payload = json.loads(semantic_match.group(1))
+                    results = []
+                    for core in payload.get("core_concepts", []):
+                        selected = {}
+                        for dim_key, entries in payload.get("candidate_pool", {}).items():
+                            if not entries:
+                                continue
+                            level2 = entries[0]
+                            level3_candidates = level2.get("level3_candidates", [])
+                            if not level3_candidates:
+                                continue
+                            selected[dim_key] = {
+                                "level2_name": level2["level2_name"],
+                                "level3_name": level3_candidates[0]["name"],
+                                "reason": "mock：候选池内低覆盖概念，作为语义兼容占位选择。",
+                            }
+                        results.append({
+                            "core_level3": core["name"],
+                            "selected_concepts": selected,
+                            "combination_reason": "mock：核心概念与候选三级概念可组成一个视频场面。",
+                            "selected_challenges": [],
+                            "confidence": 0.8,
+                        })
+                    return json.dumps(results, ensure_ascii=False)
+
                 core_names = re.findall(r'\d+\.\s+(.+?)\s+\(', prompt)
                 if not core_names:
                     return json.dumps([])
 
-                templates = [
-                    {
-                        'motion_level2': '体育运动-跑步行走类运动',
-                        'scene_level2': '自然环境-陆地环境',
-                        'audio_level2': '自然声音',
-                    },
-                    {
-                        'motion_level2': '体育运动-球类运动',
-                        'scene_level2': '人造建筑-体育场馆',
-                        'audio_level2': '环境音',
-                    },
-                    {
-                        'motion_level2': '舞蹈-现代舞',
-                        'scene_level2': '人造建筑-室内空间',
-                        'audio_level2': '音乐',
-                    },
-                    {
-                        'motion_level2': '体育运动-水上类运动',
-                        'scene_level2': '自然环境-水体环境',
-                        'audio_level2': '自然声音',
-                    },
-                    {
-                        'motion_level2': '家务活动-打扫清洁',
-                        'scene_level2': '人造建筑-住宅',
-                        'audio_level2': '环境音',
-                    },
-                ]
+                level2_by_dim = {}
+                current_dim = None
+                for line in prompt.splitlines():
+                    section = re.match(r'^### .+?\(([^)]+)\)\s*$', line.strip())
+                    if section:
+                        current_dim = section.group(1).strip()
+                        level2_by_dim.setdefault(current_dim, [])
+                        continue
+                    if current_dim and line.startswith('- '):
+                        level2_by_dim[current_dim].append(line[2:].strip())
+                    elif line.startswith('## '):
+                        current_dim = None
 
                 results = []
                 for i, name in enumerate(core_names):
-                    template = templates[i % len(templates)]
+                    selected_level2 = {
+                        dim_key: names[i % len(names)]
+                        for dim_key, names in level2_by_dim.items()
+                        if names
+                    }
                     results.append({
                         'core_level3': name,
-                        **template,
+                        'selected_level2': selected_level2,
+                        'combination_reason': 'mock：核心概念与选中二级类目在整体视频场面上兼容。',
+                        'selected_challenges': [],
+                        'risk_flags': [],
                         'confidence': 0.8,
-                        'note': 'mock',
                     })
                 return json.dumps(results)
 
@@ -148,16 +218,18 @@ def run_core_concept_pipeline(config: Config, dry_run: bool):
     output_path = Path(config.output_path)
     if dry_run:
         output_path = output_path.with_name(f"dry_run_{output_path.name}")
+    review_output_path = derive_review_output_path(output_path)
 
     existing_prompts = []
     prompt_counter = 0
-    if output_path.exists() and not dry_run:
+    resume_path = review_output_path if review_output_path.exists() else output_path
+    if resume_path.exists() and not dry_run:
         try:
-            with open(output_path, 'r', encoding='utf-8') as f:
+            with open(resume_path, 'r', encoding='utf-8') as f:
                 old_data = json.load(f)
             existing_prompts = old_data.get('prompts', [])
             prompt_counter = len(existing_prompts)
-            print(f"  [Resume] 加载已有 {prompt_counter} 条prompt，从中断处继续")
+            print(f"  [Resume] 从 {resume_path} 加载已有 {prompt_counter} 条prompt，从中断处继续")
         except Exception:
             print("  [Resume] 无法解析已有输出，从头开始")
 
@@ -196,7 +268,11 @@ def run_core_concept_pipeline(config: Config, dry_run: bool):
             difficulty_params.element_categories_min,
             difficulty_params.element_categories_max,
         )
-        sampled = pipeline.core_sampler.sample_combination(num_dimensions=target_num_dimensions)
+        target_challenge_count = _sample_challenge_count(difficulty_params)
+        sampled = pipeline.core_sampler.sample_combination(
+            num_dimensions=target_num_dimensions,
+            target_challenge_count=target_challenge_count,
+        )
         if sampled is None:
             no_new_combo_count += 1
             if no_new_combo_count >= 5:
@@ -205,6 +281,17 @@ def run_core_concept_pipeline(config: Config, dry_run: bool):
                     print("\n  三级全覆盖完成！")
                 else:
                     print("\n  无更多可生成组合，阶段一结束")
+                break
+            continue
+        if len(sampled.concepts) != target_num_dimensions:
+            no_new_combo_count += 1
+            print(
+                f"  [Skip] 维度数量不匹配: difficulty={difficulty_level}, "
+                f"target={target_num_dimensions}, actual={len(sampled.concepts)}",
+                flush=True,
+            )
+            if no_new_combo_count >= 5:
+                print("\n  连续采样维度不匹配，阶段一结束")
                 break
             continue
         no_new_combo_count = 0
@@ -287,8 +374,21 @@ def run_core_concept_pipeline(config: Config, dry_run: bool):
                 else:
                     num_dims = 4
 
-                sampled = _random_combination_from_pool(all_covered, num_dims, pipeline)
+                difficulty_params = pipeline.difficulty_manager.get_params(level)
+                target_challenge_count = _sample_challenge_count(difficulty_params)
+                sampled = pipeline.core_sampler.sample_combination_from_anchor_pool(
+                    all_covered,
+                    num_dimensions=num_dims,
+                    target_challenge_count=target_challenge_count,
+                )
                 if not sampled:
+                    continue
+                if len(sampled.concepts) != num_dims:
+                    print(
+                        f"  [Skip Phase2] 维度数量不匹配: difficulty={level}, "
+                        f"target={num_dims}, actual={len(sampled.concepts)}",
+                        flush=True,
+                    )
                     continue
 
                 combination = pipeline.combiner.create_combination_from_core_selection(
@@ -356,24 +456,31 @@ def _generate_or_mock(
     output_writer: OutputWriter,
     stats_collector: StatsCollector,
     combination,
-    sampled: Dict[str, SampledConcept],
+    sampled: SampledCombination,
     prompt_counter: int,
     dry_run_prefix: str = '[Dry-run]',
 ) -> int:
+    sampled_concepts = sampled.concepts if isinstance(sampled, SampledCombination) else sampled
     if pipeline.dry_run:
-        mock_text = f"{dry_run_prefix} Prompt based on: {list(sampled.keys())}"
+        mock_text = f"{dry_run_prefix} Prompt based on: {list(sampled_concepts.keys())}"
+        concept_dict = {k: v.to_dict() for k, v in sampled_concepts.items()}
         prompt_dict = {
             'prompt_id': f"P-{prompt_counter + 1:05d}",
             'combination_id': combination.combination_id,
             'difficulty': {'level': combination.difficulty_level.upper()},
+            'concepts': concept_dict,
+            'challenge_elements': combination.challenge_elements,
+            'selection_trace': combination.selection_trace or {},
             'sampling': {
                 'combination_id': combination.combination_id,
-                'categories_selected': list(sampled.keys()),
-                'concepts': {k: v.to_dict() for k, v in sampled.items()},
+                'categories_selected': list(sampled_concepts.keys()),
+                'concepts': concept_dict,
                 'challenge_elements': combination.challenge_elements,
+                'selection_trace': combination.selection_trace or {},
+                'phase': combination.phase,
             },
             'text': mock_text,
-            'text_length': len(mock_text.split()),
+            'text_length': count_chinese_chars(mock_text),
             'llm': {'provider': 'mock', 'model': 'dry-run'},
             'metadata': {'created_at': '2026-04-23T00:00:00Z'},
         }
@@ -420,6 +527,13 @@ def _build_difficulty_pool(distribution: Dict[str, int]) -> List[str]:
 
 def _sample_from_pool(pool: List[str]) -> str:
     return random.choice(pool)
+
+
+def _sample_challenge_count(difficulty_params) -> int:
+    return random.randint(
+        difficulty_params.challenge_count_min,
+        max(difficulty_params.challenge_count_min, difficulty_params.challenge_count_max),
+    )
 
 
 def _get_max_numeric_id(items: List[Dict], field: str, prefix: str) -> int:

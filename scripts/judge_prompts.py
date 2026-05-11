@@ -13,6 +13,8 @@ sys.path.insert(0, str(ROOT))
 
 from src.config import load_config
 from src.judge import (
+    DEFAULT_TARGET_INPUT_TOKENS,
+    JUDGE_DIMENSION_KEYS,
     OpenAICompatibleJudgeProvider,
     build_token_budget_batches,
     judge_prompt_record,
@@ -50,11 +52,16 @@ def main() -> None:
     output_dir = _resolve_path(args.output_dir or judge_cfg.get("output_dir", "reports/judge"))
     resume = bool(judge_cfg.get("resume", True)) and not args.no_resume
     max_context_tokens = int(judge_cfg.get("max_context_tokens", 200000))
-    target_fraction = float(judge_cfg.get("target_context_fraction", 0.4))
-    target_input_tokens = int(judge_cfg.get("target_input_tokens", max_context_tokens * target_fraction))
+    target_fraction = float(judge_cfg.get("target_context_fraction", 0.05))
+    target_input_tokens = int(judge_cfg.get("target_input_tokens", DEFAULT_TARGET_INPUT_TOKENS))
     max_batch_size = args.max_batch_size
     if max_batch_size is None:
         max_batch_size = int(judge_cfg.get("max_prompts_per_batch", 0))
+    runtime_judge_cfg = dict(judge_cfg)
+    runtime_judge_cfg["max_context_tokens"] = max_context_tokens
+    runtime_judge_cfg["target_context_fraction"] = target_fraction
+    runtime_judge_cfg["target_input_tokens"] = target_input_tokens
+    runtime_judge_cfg["max_prompts_per_batch"] = max_batch_size
 
     provider = OpenAICompatibleJudgeProvider(judge_cfg)
     if args.dry_run:
@@ -77,13 +84,19 @@ def main() -> None:
         model_label = spec.get("model_label") or input_path.stem
         prompts = load_prompt_file(input_path)
         selected = stratified_sample_prompts(prompts, sample_size, seed)
-        output_path = output_dir / f"{model_label}_{judge_cfg.get('provider', 'glm')}_{judge_cfg.get('judge_version', 'v1')}.json"
+        report_stem = f"{model_label}_{judge_cfg.get('provider', 'glm')}_{judge_cfg.get('judge_version', 'v1')}"
+        report_dir = output_dir / report_stem
+        output_path = report_dir / "full.json"
+        legacy_output_path = output_dir / f"{report_stem}.json"
 
         print(
             f"[Judge] {model_label}: total={len(prompts)}, selected={len(selected)}, "
-            f"output={output_path}"
+            f"output_dir={report_dir}"
         )
-        existing_results, judged_ids = load_existing_results(output_path) if resume else ([], set())
+        existing_results, judged_ids = (
+            _load_existing_results(output_path, legacy_output_path)
+            if resume else ([], set())
+        )
         results = list(existing_results)
         pending = [item for item in selected if item.get("prompt_id") not in judged_ids]
         batches = build_token_budget_batches(
@@ -129,13 +142,13 @@ def main() -> None:
             processed += len(batch_records)
 
             if batch_index % 2 == 0 or batch_index == len(batches):
-                _write_report(output_path, results, input_path, model_label, prompts, selected, judge_cfg)
+                _write_report(output_path, results, input_path, model_label, prompts, selected, runtime_judge_cfg)
                 print(
                     f"  checkpoint: {len(results)} judged "
                     f"(processed {processed}/{len(pending)}, batch {batch_index}/{len(batches)})"
                 )
 
-        _write_report(output_path, results, input_path, model_label, prompts, selected, judge_cfg)
+        _write_report(output_path, results, input_path, model_label, prompts, selected, runtime_judge_cfg)
 
 
 def _resolve_input_specs(judge_cfg: Dict[str, Any], cli_inputs: List[str] | None) -> List[Dict[str, str]]:
@@ -175,6 +188,15 @@ def _write_report(
         "selected_prompts": len(selected),
     }
     write_judge_report(output_path, results, source_info, judge_info)
+
+
+def _load_existing_results(output_path: Path, legacy_output_path: Path):
+    if output_path.exists():
+        return load_existing_results(output_path)
+    if legacy_output_path.exists():
+        print(f"  [Resume] using legacy judge report: {legacy_output_path}")
+        return load_existing_results(legacy_output_path)
+    return [], set()
 
 
 def _print_batch_plan(batches: List[Dict[str, Any]]) -> None:
@@ -228,19 +250,15 @@ def _error_result(prompt_record: Dict[str, Any], exc: Exception) -> Dict[str, An
         "source_llm": prompt_record.get("llm", {}),
         "difficulty": prompt_record.get("difficulty", {}),
         "text": prompt_record.get("text", ""),
+        "concepts": prompt_record.get("concepts", {}),
+        "challenge_elements": prompt_record.get("challenge_elements", []),
+        "selection_trace": prompt_record.get("selection_trace", {}),
         "sampling": prompt_record.get("sampling", {}),
         "rule_precheck": {},
         "llm_judge": {
             "overall_decision": "FAIL",
             "overall_score": 1,
-            "dimension_scores": {
-                "concept_fidelity": 1,
-                "clarity": 1,
-                "internal_consistency": 1,
-                "language_quality": 1,
-                "video_prompt_usability": 1,
-                "difficulty_alignment": 1,
-            },
+            "dimension_scores": {key: 1 for key in JUDGE_DIMENSION_KEYS},
             "concept_checks": [],
             "issues": [{
                 "severity": "fatal",
@@ -249,6 +267,11 @@ def _error_result(prompt_record: Dict[str, Any], exc: Exception) -> Dict[str, An
                 "description": str(exc),
                 "suggested_fix": "Inspect raw provider error and retry.",
             }],
+            "combination_issue": {
+                "is_concept_combination_problem": False,
+                "should_add_to_contradiction_pool": False,
+                "reason": "",
+            },
             "short_summary": "Judge call failed.",
         },
         "judge_error": str(exc),
